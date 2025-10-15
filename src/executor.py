@@ -240,85 +240,369 @@ class RewriteExecutor:
             
             task = progress.add_task("处理提交分组...", total=len(groups))
             
-            for i, group in enumerate(groups):
-                try:
-                    # 更新进度
-                    progress.update(task, advance=1, description=f"处理分组 {i+1}/{len(groups)}")
-                    
-                    # 处理分组
-                    self._process_group(group, prompt_template)
-                    
-                    # 保存检查点
-                    if group:
-                        last_commit = group[-1]
-                        self.state_manager.save_checkpoint(
-                            last_commit['hash'],
-                            i + 1
-                        )
-                    
-                except Exception as e:
-                    console.print(f"[red]处理分组 {i+1} 失败: {e}[/red]")
-                    logger.exception(f"处理分组 {i+1} 时发生错误")
-                    continue
+            # 执行逐步 rebase
+            self._execute_stepwise_rebase(groups, prompt_template, progress, task)
         
         console.print("[green]✓ 重写执行完成[/green]")
+        
+        # 完成重写流程
+        if not self.dry_run:
+            self._finalize_rewrite()
     
-    def _process_group(self, group: List[Dict[str, Any]], prompt_template: str) -> None:
-        """处理单个分组."""
-        if not group:
-            return
+    def _execute_stepwise_rebase(self, groups: List[List[Dict[str, Any]]], 
+                                prompt_template: str, progress, task) -> None:
+        """执行逐步 rebase：每次 LLM 返回结果后立即执行一次 rebase."""
+        if self.dry_run:
+            # Dry-run 模式：只显示预览
+            for i, group in enumerate(groups):
+                progress.update(task, advance=1, description=f"预览分组 {i+1}/{len(groups)}")
+                self._process_group_dry_run(group, prompt_template)
+        else:
+            # 实际执行：逐步执行 rebase
+            self._stepwise_rebase_execution(groups, prompt_template, progress, task)
+    
+    def _stepwise_rebase_execution(self, groups: List[List[Dict[str, Any]]], 
+                                  prompt_template: str, progress, task) -> None:
+        """逐步执行 rebase：每次处理一个分组，立即应用修改."""
+        try:
+            console.print("[bold]开始逐步执行 git rebase...[/bold]")
+            
+            # 获取所有原始提交
+            all_commits = self.db_manager.get_all_commits()
+            console.print(f"[dim]数据库中共有 {len(all_commits)} 个提交[/dim]")
+            
+            if not all_commits:
+                console.print("[yellow]没有找到提交，跳过 rebase[/yellow]")
+                return
+            
+            # 找到第一个非 root commit（最老的，但有父提交的）
+            non_root_commits = [c for c in all_commits if c.get('parent_hash')]
+            if not non_root_commits:
+                console.print("[yellow]没有找到非 root commit，跳过 rebase[/yellow]")
+                return
+            
+            first_commit = min(non_root_commits, key=lambda x: x['commit_date'])
+            console.print(f"[dim]找到第一个非 root commit: {first_commit['hash'][:8]} ({first_commit['message']})[/dim]")
+            console.print(f"[dim]完整哈希: {first_commit['hash']}[/dim]")
+            
+            # 逐步处理每个分组
+            for i, group in enumerate(groups):
+                progress.update(task, advance=1, description=f"处理分组 {i+1}/{len(groups)}")
+                
+                # 跳过 root commit
+                if len(group) == 1 and not group[0].get('parent_hash'):
+                    console.print(f"[yellow]跳过 root commit: {group[0]['hash'][:8]}[/yellow]")
+                    continue
+                
+                # 调用 LLM 生成新消息
+                if len(group) == 1:
+                    new_message = self.ai_rewriter.rewrite_single_commit(group[0], prompt_template)
+                else:
+                    new_message = self.ai_rewriter.merge_commit_messages(group, prompt_template)
+                
+                new_message = self.ai_rewriter.apply_conventional_format(new_message)
+                
+                console.print(f"[dim]分组 {i+1}: {len(group)} 个提交 -> {new_message}[/dim]")
+                
+                # 立即执行 rebase 应用这个修改
+                console.print(f"[dim]传递给 rebase 的 base_commit: {first_commit['hash']}[/dim]")
+                self._execute_single_rebase_step(group, new_message, first_commit['hash'])
+                
+                # 更新状态
+                self._update_state_after_rebase(group, new_message)
+                
+            console.print("[green]✓ 逐步 rebase 执行完成[/green]")
+            
+        except Exception as e:
+            console.print(f"[red]✗ 逐步 rebase 失败: {e}[/red]")
+            logger.exception("逐步 rebase 失败")
+            raise
+    
+    def _execute_single_rebase_step(self, group: List[Dict[str, Any]], 
+                                   new_message: str, base_commit: str) -> None:
+        """执行单个 rebase 步骤：处理一个提交组."""
+        try:
+            # 创建针对这个分组的 rebase 脚本
+            rebase_script = self._create_single_group_rebase_script(group, new_message)
+            
+            if not rebase_script.strip():
+                console.print("[yellow]生成的 rebase 脚本为空，跳过[/yellow]")
+                return
+            
+            # 清理未跟踪的文件
+            self._cleanup_untracked_files()
+            
+            # 执行交互式 rebase
+            console.print(f"[dim]执行单个 rebase 步骤...[/dim]")
+            self._execute_interactive_rebase(base_commit, rebase_script, new_message)
+            
+            console.print(f"[green]✓ 单个 rebase 步骤完成[/green]")
+            
+        except Exception as e:
+            console.print(f"[red]✗ 单个 rebase 步骤失败: {e}[/red]")
+            logger.exception("单个 rebase 步骤失败")
+            raise
+    
+    def _create_single_group_rebase_script(self, group: List[Dict[str, Any]], 
+                                         new_message: str) -> str:
+        """为单个分组创建 rebase 脚本."""
+        script_lines = []
         
         if len(group) == 1:
-            # 单个提交，重写 message
-            self._rewrite_single_commit(group[0], prompt_template)
+            # 单个提交：reword
+            commit = group[0]
+            console.print(f"[dim]单个提交哈希: {commit['hash']}[/dim]")
+            script_lines.append(f"reword {commit['hash']}")
         else:
-            # 多个提交，合并
-            self._merge_commits(group, prompt_template)
+            # 多个提交：第一个 reword，其他 squash
+            console.print(f"[dim]第一个提交哈希: {group[0]['hash']}[/dim]")
+            script_lines.append(f"reword {group[0]['hash']}")
+            for commit in group[1:]:
+                console.print(f"[dim]其他提交哈希: {commit['hash']}[/dim]")
+                script_lines.append(f"squash {commit['hash']}")
+        
+        script = '\n'.join(script_lines)
+        console.print(f"[dim]单个分组 rebase 脚本:[/dim]")
+        console.print(f"[dim]{script}[/dim]")
+        
+        return script
     
-    def _rewrite_single_commit(self, commit: Dict[str, Any], prompt_template: str) -> None:
-        """重写单个提交."""
-        if self.dry_run:
-            console.print(f"[yellow][DRY-RUN] 重写提交: {commit['hash'][:8]}[/yellow]")
-            console.print(f"  原始: {commit['message']}")
+    def _execute_interactive_rebase(self, base_commit: str, script: str, new_message: str = None) -> None:
+        """执行交互式 rebase."""
+        import tempfile
+        import os
+        
+        try:
+            console.print(f"[bold]开始执行 git rebase -i {base_commit[:8]}...[/bold]")
+            console.print(f"[dim]Rebase 脚本:[/dim]")
+            console.print(f"[dim]{script}[/dim]")
             
-            # 模拟 AI 重写
-            new_message = self.ai_rewriter.rewrite_single_commit(commit, prompt_template)
+            # 创建临时脚本文件
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.rebase', delete=False) as f:
+                f.write(script)
+                script_path = f.name
+            
+            console.print(f"[dim]临时脚本文件: {script_path}[/dim]")
+            
+            # 创建一个包装脚本来处理 rebase 过程
+            wrapper_script = self._create_rebase_wrapper(script_path, new_message)
+            
+            # 设置环境变量
+            env = os.environ.copy()
+            env['GIT_EDITOR'] = wrapper_script
+            
+            console.print("[dim]执行 git rebase 命令...[/dim]")
+            console.print(f"[dim]环境变量 GIT_EDITOR: {env['GIT_EDITOR']}[/dim]")
+            
+            # 执行 rebase
+            result = self.git_ops.repo.git.rebase('-i', base_commit, env=env)
+            console.print(f"[green]✓ Git rebase 执行成功[/green]")
+            console.print(f"[dim]结果: {result}[/dim]")
+            
+            # 清理临时文件
+            os.unlink(script_path)
+            os.unlink(wrapper_script)
+            console.print("[dim]临时文件已清理[/dim]")
+            
+        except Exception as e:
+            console.print(f"[red]✗ Git rebase 执行失败: {e}[/red]")
+            logger.exception("Git rebase 执行失败")
+            
+            # 如果 rebase 失败，尝试中止
+            try:
+                console.print("[yellow]尝试中止 rebase...[/yellow]")
+                self.git_ops.repo.git.rebase('--abort')
+                console.print("[green]✓ Rebase 已中止[/green]")
+            except Exception as abort_error:
+                console.print(f"[red]✗ 中止 rebase 失败: {abort_error}[/red]")
+                logger.exception("中止 rebase 失败")
+            
+            # 清理临时文件
+            try:
+                if 'script_path' in locals():
+                    os.unlink(script_path)
+                if 'wrapper_script' in locals():
+                    os.unlink(wrapper_script)
+            except:
+                pass
+            
+            raise
+    
+    def _create_rebase_wrapper(self, script_path: str, new_message: str = None) -> str:
+        """创建 rebase 包装脚本."""
+        import tempfile
+        import os
+        
+        if new_message:
+            # 如果提供了新消息，自动设置提交消息
+            # 转义消息中的特殊字符
+            escaped_message = new_message.replace("'", "'\\''")
+            wrapper_content = f"""#!/bin/bash
+# 复制 rebase 脚本到目标文件
+cp "{script_path}" "$1"
+
+# 自动设置提交消息（使用 echo 写入消息文件）
+echo '{escaped_message}' > "$1.msg"
+"""
+        else:
+            # 如果没有新消息，只复制脚本
+            wrapper_content = f"""#!/bin/bash
+# 复制 rebase 脚本到目标文件
+cp "{script_path}" "$1"
+"""
+        
+        # 创建可执行的包装脚本
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+            f.write(wrapper_content)
+            wrapper_path = f.name
+        
+        # 使脚本可执行
+        os.chmod(wrapper_path, 0o755)
+        
+        return wrapper_path
+    
+    def _cleanup_untracked_files(self) -> None:
+        """清理未跟踪的文件."""
+        try:
+            console.print("[dim]清理未跟踪的文件...[/dim]")
+            
+            import os
+            import shutil
+            
+            # 使用 git clean 强制清理所有未跟踪的文件和目录
+            try:
+                # 先尝试使用 git clean 清理
+                result = self.git_ops.repo.git.clean('-fd')
+                if result:
+                    console.print(f"[dim]git clean 清理结果: {result}[/dim]")
+                console.print("[green]✓ 使用 git clean 清理完成[/green]")
+            except Exception as clean_error:
+                console.print(f"[yellow]git clean 失败: {clean_error}[/yellow]")
+                # 如果 git clean 失败，回退到手动清理
+                
+                # 使用 git status 获取更准确的未跟踪文件列表
+                status_output = self.git_ops.repo.git.status('--porcelain')
+                untracked_files = []
+                
+                for line in status_output.split('\n'):
+                    if line.startswith('?? '):
+                        # ?? 表示未跟踪的文件
+                        file_path = line[3:].strip()
+                        untracked_files.append(file_path)
+                
+                if untracked_files:
+                    console.print(f"[dim]发现未跟踪文件: {untracked_files}[/dim]")
+                    
+                    # 删除所有未跟踪的文件和目录
+                    for file in untracked_files:
+                        file_path = os.path.join(self.git_ops.repo.working_dir, file)
+                        if os.path.exists(file_path):
+                            if os.path.isfile(file_path):
+                                os.remove(file_path)
+                                console.print(f"[dim]已删除文件: {file}[/dim]")
+                            elif os.path.isdir(file_path):
+                                shutil.rmtree(file_path)
+                                console.print(f"[dim]已删除目录: {file}[/dim]")
+                else:
+                    console.print("[dim]没有未跟踪的文件[/dim]")
+                
+        except Exception as e:
+            console.print(f"[yellow]⚠ 清理未跟踪文件失败: {e}[/yellow]")
+            logger.warning(f"清理未跟踪文件失败: {e}")
+    
+    def _process_group_dry_run(self, group: List[Dict[str, Any]], prompt_template: str) -> None:
+        """Dry-run 模式处理分组."""
+        if len(group) == 1:
+            # 单个提交重写
+            new_message = self.ai_rewriter.rewrite_single_commit(group[0], prompt_template)
             new_message = self.ai_rewriter.apply_conventional_format(new_message)
-            
+            console.print(f"[yellow][DRY-RUN] 重写提交: {group[0]['hash'][:8]}[/yellow]")
+            console.print(f"  原始: {group[0]['message']}")
             console.print(f"  新消息: {new_message}")
         else:
-            # 实际重写
-            new_message = self.ai_rewriter.rewrite_single_commit(commit, prompt_template)
+            # 多个提交合并
+            new_message = self.ai_rewriter.merge_commit_messages(group, prompt_template)
             new_message = self.ai_rewriter.apply_conventional_format(new_message)
-            
-            # 这里应该实际创建新的提交，但为了简化，只更新状态
-            self.state_manager.mark_commit_processed(commit['hash'], 'rewritten')
-            console.print(f"[green]✓ 重写完成: {commit['hash'][:8]}[/green]")
-    
-    def _merge_commits(self, group: List[Dict[str, Any]], prompt_template: str) -> None:
-        """合并多个提交."""
-        if self.dry_run:
             console.print(f"[yellow][DRY-RUN] 合并 {len(group)} 个提交[/yellow]")
-            
-            # 显示原始消息
             for i, commit in enumerate(group):
                 console.print(f"  {i+1}. {commit['hash'][:8]}: {commit['message']}")
-            
-            # 模拟 AI 合并
-            new_message = self.ai_rewriter.merge_commit_messages(group, prompt_template)
-            new_message = self.ai_rewriter.apply_conventional_format(new_message)
-            
             console.print(f"  合并后: {new_message}")
-        else:
-            # 实际合并
-            new_message = self.ai_rewriter.merge_commit_messages(group, prompt_template)
-            new_message = self.ai_rewriter.apply_conventional_format(new_message)
+    
+    
+    def _finalize_rewrite(self) -> None:
+        """完成重写流程."""
+        try:
+            # 强制推送以更新远程历史
+            self._force_push_if_needed()
             
-            # 这里应该实际创建合并的提交，但为了简化，只更新状态
+            # 清理悬空对象
+            self._cleanup_dangling_objects()
+            
+        except Exception as e:
+            console.print(f"[red]✗ 完成重写失败: {e}[/red]")
+            logger.exception("完成重写失败")
+            raise
+    
+    def _force_push_if_needed(self) -> None:
+        """如果需要，强制推送到远程仓库."""
+        try:
+            # 检查是否有远程仓库
+            if not self.git_ops.repo.remotes:
+                console.print("[yellow]没有远程仓库，跳过推送[/yellow]")
+                return
+            
+            # 检查当前分支是否跟踪远程分支
+            current_branch = self.git_ops.repo.active_branch
+            if not current_branch.tracking_branch():
+                console.print("[yellow]当前分支没有跟踪远程分支，跳过推送[/yellow]")
+                return
+            
+            # 提示用户是否强制推送
+            console.print("[bold yellow]⚠ 警告：历史重写需要强制推送[/bold yellow]")
+            console.print("[yellow]这将覆盖远程仓库的历史，请确保没有其他人在使用此分支[/yellow]")
+            
+            # 这里可以添加用户确认逻辑
+            # 暂时自动执行强制推送
+            remote_name = current_branch.tracking_branch().remote_name
+            branch_name = current_branch.name
+            
+            console.print(f"[bold]强制推送到 {remote_name}/{branch_name}...[/bold]")
+            self.git_ops.repo.git.push('--force-with-lease', remote_name, branch_name)
+            
+            console.print("[green]✓ 强制推送完成[/green]")
+            
+        except Exception as e:
+            console.print(f"[red]✗ 强制推送失败: {e}[/red]")
+            logger.exception("强制推送失败")
+            # 不抛出异常，因为推送失败不应该阻止本地重写
+    
+    def _update_state_after_rebase(self, group: List[Dict[str, Any]], new_message: str) -> None:
+        """在 rebase 后更新状态."""
+        try:
+            # 获取当前 HEAD 作为新的提交哈希
+            current_head = self.git_ops.repo.head.commit.hexsha
+            
+            # 更新状态映射
             for commit in group:
-                self.state_manager.mark_commit_processed(commit['hash'], 'merged')
+                self.state_manager.update_commit_status(commit['hash'], 'done')
+                self.state_manager.add_hash_mapping(commit['hash'], current_head)
             
-            console.print(f"[green]✓ 合并完成: {len(group)} 个提交[/green]")
+            console.print(f"[dim]状态已更新: {len(group)} 个提交映射到 {current_head[:8]}[/dim]")
+            
+        except Exception as e:
+            console.print(f"[yellow]⚠ 更新状态失败: {e}[/yellow]")
+            logger.warning(f"更新状态失败: {e}")
+    
+    def _cleanup_dangling_objects(self) -> None:
+        """清理悬空对象."""
+        try:
+            # 运行 git gc 清理悬空对象
+            self.git_ops.repo.git.gc('--prune=now')
+            console.print("[green]✓ 已清理悬空对象[/green]")
+        except Exception as e:
+            console.print(f"[yellow]⚠ 清理悬空对象失败: {e}[/yellow]")
+            logger.warning(f"清理悬空对象失败: {e}")
+    
     
     def _verify_results(self) -> None:
         """验证结果."""
@@ -382,14 +666,33 @@ class RewriteExecutor:
         """显示详细分析结果."""
         console.print("[bold]详细分析结果:[/bold]")
         
+        # 获取提示词模板
+        prompts = self.config_manager.get_prompts()
+        prompt_template = prompts.get('analyze_diff', '')
+        
         for i, group in enumerate(groups):
             console.print(f"\n[bold cyan]分组 {i+1}[/bold cyan] ({len(group)} 个提交):")
             
             for j, commit in enumerate(group):
                 console.print(f"  {j+1}. {commit['hash'][:8]}: {commit['message']}")
             
-            if len(group) > 1:
-                console.print(f"  [yellow]→ 将合并为 1 个提交[/yellow]")
+            # 显示 AI 生成的新 message（预览）
+            try:
+                if len(group) == 1:
+                    # 单个提交重写
+                    new_message = self.ai_rewriter.rewrite_single_commit(group[0], prompt_template)
+                    new_message = self.ai_rewriter.apply_conventional_format(new_message)
+                    console.print(f"  [green]→ 重写为: {new_message}[/green]")
+                else:
+                    # 多个提交合并
+                    new_message = self.ai_rewriter.merge_commit_messages(group, prompt_template)
+                    new_message = self.ai_rewriter.apply_conventional_format(new_message)
+                    console.print(f"  [green]→ 合并为: {new_message}[/green]")
+            except Exception as e:
+                console.print(f"  [red]→ AI 生成失败: {e}[/red]")
+                # 使用降级策略
+                fallback_msg = self.ai_rewriter._fallback_generate("")
+                console.print(f"  [yellow]→ 降级策略: {fallback_msg}[/yellow]")
     
     def get_status(self) -> Dict[str, Any]:
         """获取当前状态."""

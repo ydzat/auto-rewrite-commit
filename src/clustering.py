@@ -135,6 +135,10 @@ class CommitClusterer:
         Returns:
             相似度分数 (0.0 - 1.0)
         """
+        # 如果 diff 完全相同，直接返回 1.0
+        if diff1 == diff2:
+            return 1.0
+            
         # 解析文件列表
         files1 = safe_json_loads(files1_str, [])
         files2 = safe_json_loads(files2_str, [])
@@ -163,14 +167,18 @@ class CommitClusterer:
         if not diff1 or not diff2:
             return 0.0
         
+        # 如果 diff 完全相同，直接返回 1.0
+        if diff1 == diff2:
+            return 1.0
+        
         # 方法 1: 简单文本相似度
         text_sim = calculate_text_similarity(diff1, diff2)
         
         # 方法 2: 基于行级别的相似度
         line_sim = self._calculate_line_similarity(diff1, diff2)
         
-        # 取平均值
-        return (text_sim + line_sim) / 2
+        # 取最大值，确保相似提交能被正确聚类
+        return max(text_sim, line_sim)
     
     def _calculate_line_similarity(self, diff1: str, diff2: str) -> float:
         """计算基于行的相似度.

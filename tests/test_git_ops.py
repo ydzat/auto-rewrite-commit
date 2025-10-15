@@ -46,7 +46,7 @@ class TestGitOperations:
         """测试仓库验证."""
         # 有效仓库
         git_ops = GitOperations(temp_repo)
-        assert git_ops.repo_path == temp_repo
+        assert str(git_ops.repo_path) == temp_repo
         
         # 无效仓库
         with pytest.raises(ValueError):

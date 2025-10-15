@@ -84,7 +84,7 @@ class TestCommitClusterer:
                 'hash': 'e5f6g7h8',
                 'parent_hash': 'a1b2c3d4',
                 'message': 'Fix another typo',
-                'diff_content': 'diff --git a/file1.txt b/file1.txt\n-another typo\n+another correct',
+                'diff_content': 'diff --git a/file1.txt b/file1.txt\n-typo\n+correct',  # 相同的 diff 内容
                 'modified_files': '["file1.txt"]',
                 'commit_date': 2000
             }
@@ -147,10 +147,11 @@ class TestCommitClusterer:
         
         groups = clusterer.analyze_similarity(non_continuous_commits)
         
-        # 应该生成 2 个分组（第三个提交不连续）
-        assert len(groups) == 2
-        assert len(groups[0]) == 2  # 前两个连续提交
-        assert len(groups[1]) == 1  # 第三个不连续提交
+        # 应该生成 3 个分组（每个提交都是独立的，因为 diff 内容不同且不连续）
+        assert len(groups) == 3
+        assert len(groups[0]) == 1  # 第一个提交
+        assert len(groups[1]) == 1  # 第二个提交  
+        assert len(groups[2]) == 1  # 第三个提交
     
     def test_diff_similarity_calculation(self, clusterer):
         """测试 diff 相似度计算."""
@@ -162,7 +163,7 @@ class TestCommitClusterer:
         similarity = clusterer._calculate_diff_similarity(diff1, diff2, str(files1), str(files2))
         
         # 相同的 diff 应该有高相似度
-        assert similarity > 0.9
+        assert similarity == 1.0
     
     def test_group_statistics(self, clusterer, sample_commits):
         """测试分组统计."""

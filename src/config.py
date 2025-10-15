@@ -8,6 +8,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# 启用调试日志
+logging.getLogger('src.git_operations').setLevel(logging.DEBUG)
+logging.getLogger('src.database').setLevel(logging.DEBUG)
+
 
 class ConfigManager:
     """配置管理器."""

@@ -122,9 +122,14 @@ class TestRewriteExecutor:
             
             mock_clusterer.analyze_similarity.return_value = []
             mock_state_manager.can_resume.return_value = False
+            mock_state_manager.get_commit_groups.return_value = []
             
             # 应该不抛出异常
-            executor.run()
+            with patch.object(executor, '_execute_rewrite') as mock_execute, \
+                 patch.object(executor, '_verify_results') as mock_verify:
+                executor.run()
+                mock_execute.assert_called_once()
+                mock_verify.assert_called_once()
     
     @patch('src.executor.GitOperations')
     @patch('src.executor.DatabaseManager')
@@ -149,9 +154,14 @@ class TestRewriteExecutor:
                 'branch': 'main'
             }
             mock_state_manager.get_commit_groups.return_value = []
+            mock_state_manager.get_pending_commits.return_value = []
             
             # 应该不抛出异常
-            executor.run()
+            with patch.object(executor, '_execute_rewrite') as mock_execute, \
+                 patch.object(executor, '_verify_results') as mock_verify:
+                executor.run()
+                mock_execute.assert_called_once()
+                mock_verify.assert_called_once()
     
     def test_get_status(self, executor):
         """测试获取状态."""

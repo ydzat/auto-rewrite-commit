@@ -102,13 +102,18 @@ class DatabaseManager:
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            
+            # 调试：检查哈希值
+            commit_hash = commit_data['hash']
+            logger.debug(f"保存提交到数据库 - 哈希: {commit_hash}, 长度: {len(commit_hash)}")
+            
             cursor.execute("""
                 INSERT OR REPLACE INTO commits 
                 (hash, parent_hash, message, diff_content, modified_files, 
                  author, author_email, commit_date, tree_hash, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                commit_data['hash'],
+                commit_hash,
                 commit_data.get('parent_hash'),
                 commit_data['message'],
                 commit_data.get('diff_content', ''),
@@ -132,11 +137,17 @@ class DatabaseManager:
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            
+            # 调试：检查查询的哈希值
+            logger.debug(f"查询提交 - 哈希: {commit_hash}, 长度: {len(commit_hash)}")
+            
             cursor.execute("SELECT * FROM commits WHERE hash = ?", (commit_hash,))
             row = cursor.fetchone()
             
             if row:
-                return dict(row)
+                result = dict(row)
+                logger.debug(f"查询结果 - 哈希: {result['hash']}, 长度: {len(result['hash'])}")
+                return result
             return None
     
     def get_pending_commits(self) -> List[Dict[str, Any]]:
@@ -242,7 +253,7 @@ class DatabaseManager:
             # 插入新的分组数据
             for i, (commit, similarity) in enumerate(zip(commits, similarities)):
                 cursor.execute("""
-                    INSERT INTO commit_groups (group_id, commit_hash, group_order, similarity)
+                    INSERT OR REPLACE INTO commit_groups (group_id, commit_hash, group_order, similarity)
                     VALUES (?, ?, ?, ?)
                 """, (group_id, commit['hash'], i, similarity))
             

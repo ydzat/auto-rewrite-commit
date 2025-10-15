@@ -140,8 +140,12 @@ class GitOperations:
         # 获取修改的文件列表
         modified_files = self._get_modified_files(commit)
         
+        # 调试：检查哈希值
+        commit_hash = commit.hexsha
+        logger.debug(f"提取提交哈希: {commit_hash}, 长度: {len(commit_hash)}")
+        
         return {
-            'hash': commit.hexsha,
+            'hash': commit_hash,
             'parent_hash': parent_hash,
             'message': commit.message.strip(),
             'diff_content': diff_content,
@@ -387,3 +391,68 @@ class GitOperations:
         except Exception as e:
             logger.error(f"重置到分支失败: {e}")
             return False
+    
+    def execute_rebase_script(self, base_commit: str, rebase_script: str, env: dict = None) -> str:
+        """执行 rebase 脚本.
+        
+        Args:
+            base_commit: 基础提交
+            rebase_script: rebase 脚本内容
+            env: 环境变量
+            
+        Returns:
+            rebase 执行结果
+        """
+        try:
+            # 执行交互式 rebase
+            result = self.repo.git.rebase('-i', base_commit, env=env)
+            logger.info(f"Rebase 执行成功: {base_commit[:8]}")
+            return result
+        except Exception as e:
+            logger.error(f"Rebase 执行失败: {e}")
+            raise
+    
+    def abort_rebase(self) -> bool:
+        """中止正在进行的 rebase.
+        
+        Returns:
+            是否成功中止
+        """
+        try:
+            self.repo.git.rebase('--abort')
+            logger.info("Rebase 已中止")
+            return True
+        except Exception as e:
+            logger.error(f"中止 rebase 失败: {e}")
+            return False
+    
+    def get_current_head(self) -> str:
+        """获取当前 HEAD 提交哈希.
+        
+        Returns:
+            HEAD 提交哈希
+        """
+        return self.repo.head.commit.hexsha
+    
+    def get_commit_chain_from_base(self, base_commit: str) -> List[Dict[str, Any]]:
+        """从基础提交开始获取提交链.
+        
+        Args:
+            base_commit: 基础提交哈希
+            
+        Returns:
+            提交链信息
+        """
+        try:
+            # 获取从基础提交到当前 HEAD 的所有提交
+            commits = list(self.repo.iter_commits(f"{base_commit}..HEAD", reverse=True))
+            commit_data_list = []
+            
+            for commit in commits:
+                commit_data = self._extract_commit_data(commit)
+                commit_data_list.append(commit_data)
+            
+            return commit_data_list
+        except Exception as e:
+            logger.error(f"获取提交链失败: {e}")
+            return []

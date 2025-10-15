@@ -60,7 +60,8 @@ class StateManager:
         """
         state = self.get_current_state()
         if state and state.get('current_position'):
-            logger.info(f"从检查点恢复: {state['current_position']}")
+            current_position = state.get('current_position')
+            logger.info(f"从检查点恢复: {current_position}")
             return state
         return None
     

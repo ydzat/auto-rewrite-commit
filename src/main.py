@@ -37,7 +37,8 @@ def analyze(
 
 @app.command()
 def run(
-    apply: bool = typer.Option(False, "--apply", help="实际执行修改（默认为 dry-run）"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="预览模式，不修改仓库"),
+    apply: bool = typer.Option(False, "--apply", help="实际执行修改"),
     config: str = typer.Option("config.yaml", "--config", "-c", help="配置文件路径"),
     threshold: float = typer.Option(0.8, "--threshold", "-t", help="相似度阈值"),
     max_group: int = typer.Option(10, "--max-group", "-g", help="最大分组大小")
@@ -45,7 +46,16 @@ def run(
     """执行 Git 历史重写."""
     try:
         # 确定是否为 dry-run 模式
-        dry_run = not apply
+        if apply and dry_run:
+            console.print("[red]错误: 不能同时使用 --dry-run 和 --apply[/red]")
+            raise typer.Exit(1)
+        
+        # 如果两个选项都没有指定，默认为 dry-run
+        if not apply and not dry_run:
+            dry_run = True
+        
+        if apply:
+            dry_run = False
         
         executor = RewriteExecutor(config, dry_run=dry_run)
         
