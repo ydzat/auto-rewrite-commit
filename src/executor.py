@@ -585,7 +585,12 @@ class RewriteExecutor:
         try:
             import os
             import shutil
-            import tempfile
+            import time
+            
+            # 使用项目根目录作为备份位置，而不是临时目录
+            project_root = Path(self.config_manager.get_repository_path()).parent
+            timestamp = int(time.time())
+            backup_dir = project_root / f"git-rewrite-backup-{timestamp}"
             
             # 使用 git clean --dry-run 获取将被清理的文件列表
             try:
@@ -625,28 +630,29 @@ class RewriteExecutor:
                 console.print("[dim]没有未跟踪的文件需要备份[/dim]")
                 return None
             
-            # 创建临时备份目录
-            backup_dir = tempfile.mkdtemp(prefix='git-rewrite-backup-')
+            # 创建备份目录
+            backup_dir.mkdir(parents=True, exist_ok=True)
             console.print(f"[dim]创建备份目录: {backup_dir}[/dim]")
             
             # 备份每个未跟踪文件
             for file_path in untracked_files:
                 src_path = os.path.join(self.git_ops.repo.working_dir, file_path)
-                dst_path = os.path.join(backup_dir, file_path)
+                dst_path = backup_dir / file_path
                 
                 if os.path.exists(src_path):
                     # 确保目标目录存在
-                    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                    dst_path.parent.mkdir(parents=True, exist_ok=True)
                     
                     if os.path.isfile(src_path):
                         shutil.copy2(src_path, dst_path)
                         console.print(f"[dim]已备份文件: {file_path}[/dim]")
                     elif os.path.isdir(src_path):
-                        shutil.copytree(src_path, dst_path)
+                        shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
                         console.print(f"[dim]已备份目录: {file_path}[/dim]")
             
             console.print(f"[green]✓ 已备份 {len(untracked_files)} 个未跟踪文件/目录[/green]")
-            return backup_dir
+            console.print(f"[yellow]备份目录: {backup_dir}[/yellow]")
+            return str(backup_dir)
             
         except Exception as e:
             console.print(f"[yellow]⚠ 备份未跟踪文件失败: {e}[/yellow]")
