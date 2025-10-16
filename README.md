@@ -35,7 +35,7 @@
 
 ```bash
 # 克隆项目
-git clone <repository-url>
+git clone https://github.com/ydzat/auto-rewrite-commit.git
 cd auto-rewrite-commit
 
 # 创建虚拟环境
