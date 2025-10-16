@@ -114,8 +114,8 @@ class RewriteExecutor:
             logger.exception("执行过程中发生错误")
             raise
         finally:
-            # 清理数据库文件
-            self._cleanup_database_file()
+            # 不自动清理数据库文件，让用户手动处理
+            console.print("[yellow]数据库文件已保留，如需清理请手动删除[/yellow]")
     
     def _start_new_execution(self) -> None:
         """开始新的执行流程."""
@@ -318,10 +318,17 @@ class RewriteExecutor:
             self.git_ops.repo.git.checkout('-b', temp_branch)
             console.print(f"[dim]创建临时分支: {temp_branch}[/dim]")
 
-            # 重置到 root 提交
-            root_commit = self.git_ops.repo.git.rev_list('--max-parents=0', 'HEAD').strip()
-            self.git_ops.repo.git.reset('--hard', root_commit)
-            console.print(f"[dim]重置到根提交: {root_commit[:8]}[/dim]")
+            # 备份未跟踪的文件
+            backup_dir = self._backup_untracked_files()
+            
+            # 清理未跟踪的文件，避免 cherry-pick 冲突
+            self._cleanup_untracked_files()
+
+            # 重置到当前分支的第一个提交，而不是整个仓库的根提交
+            # 这确保我们只处理当前分支上的提交，避免复杂分支历史的冲突
+            branch_root_commit = self.git_ops.repo.git.rev_list('--max-parents=0', 'HEAD').strip()
+            self.git_ops.repo.git.reset('--hard', branch_root_commit)
+            console.print(f"[dim]重置到当前分支的根提交: {branch_root_commit[:8]}[/dim]")
 
             # 获取所有提交的有序列表
             all_commits = self.db_manager.get_all_commits()
@@ -332,6 +339,11 @@ class RewriteExecutor:
                 commit_hash = commit['hash']
                 progress.update(task, advance=1, description=f"处理提交 {i+1}/{len(sorted_commits)}: {commit_hash[:8]}")
 
+                # 每次处理提交前都执行备份/恢复，确保环境干净
+                if backup_dir:
+                    self._restore_untracked_files(backup_dir)
+                self._cleanup_untracked_files()
+
                 try:
                     # Cherry-pick 提交
                     self.git_ops.repo.git.cherry_pick(commit_hash, '--allow-empty', '--keep-redundant-commits')
@@ -339,21 +351,44 @@ class RewriteExecutor:
                     # 如果需要修改消息
                     if commit_hash in commit_messages:
                         new_message = commit_messages[commit_hash]
-                        self.git_ops.repo.git.commit('--amend', '-m', new_message, '--allow-empty', '--no-edit')
+                        self.git_ops.repo.git.commit('--amend', '-m', new_message, '--allow-empty', '--no-edit', '--no-verify')
                         console.print(f"[dim]修改提交 {commit_hash[:8]} 的消息[/dim]")
                     
                 except Exception as cherry_error:
                     console.print(f"[yellow]Cherry-pick 失败 {commit_hash[:8]}: {cherry_error}[/yellow]")
-                    # 尝试继续
+                    
+                    # 跳过所有冲突，不尝试解决
+                    console.print(f"[red]✗ 跳过冲突提交 {commit_hash[:8]}[/red]")
+                    # 尝试中止 cherry-pick 并清理状态
                     try:
-                        self.git_ops.repo.git.cherry_pick('--continue')
-                    except:
                         self.git_ops.repo.git.cherry_pick('--abort')
-                        raise cherry_error
+                        console.print(f"[dim]已中止 cherry-pick {commit_hash[:8]}[/dim]")
+                    except Exception as abort_error:
+                        console.print(f"[yellow]中止 cherry-pick 失败: {abort_error}[/yellow]")
+                        # 如果中止失败，尝试强制重置到干净状态
+                        try:
+                            self.git_ops.repo.git.reset('--hard', 'HEAD')
+                            self.git_ops.repo.git.clean('-fd')
+                            console.print(f"[dim]已强制清理工作区[/dim]")
+                        except Exception as reset_error:
+                            console.print(f"[yellow]强制清理失败: {reset_error}[/yellow]")
 
             # 切换回原始分支并强制更新
             console.print(f"[dim]切换回分支: {current_branch}[/dim]")
-            self.git_ops.repo.git.checkout(current_branch)
+            
+            # 确保工作区干净后再切换分支
+            try:
+                # 提交任何剩余的更改
+                status = self.git_ops.repo.git.status('--porcelain')
+                if status.strip():
+                    console.print("[dim]提交剩余更改...[/dim]")
+                    self.git_ops.repo.git.add('.')
+                    self.git_ops.repo.git.commit('-m', 'chore: resolve remaining conflicts', '--allow-empty', '--no-verify')
+            except Exception as e:
+                console.print(f"[yellow]提交剩余更改失败: {e}[/yellow]")
+            
+            # 强制切换回原始分支
+            self.git_ops.repo.git.checkout(current_branch, '--force')
             
             console.print(f"[dim]强制更新分支 {current_branch} 到 {temp_branch}[/dim]")
             self.git_ops.repo.git.reset('--hard', temp_branch)
@@ -362,18 +397,128 @@ class RewriteExecutor:
             self.git_ops.repo.git.branch('-D', temp_branch)
             console.print(f"[dim]删除临时分支: {temp_branch}[/dim]")
 
+            # 恢复备份的未跟踪文件
+            if backup_dir:
+                self._restore_untracked_files(backup_dir)
+                # 显示备份位置，让用户手动检查
+                console.print(f"[yellow]备份文件已恢复，请检查目标仓库文件是否完整[/yellow]")
+                console.print(f"[yellow]备份目录位置: {backup_dir}[/yellow]")
+                console.print(f"[yellow]如文件丢失，请从备份目录手动恢复[/yellow]")
+
             console.print("[green]✓ 顺序 cherry-pick 重写完成[/green]")
 
         except Exception as e:
             console.print(f"[red]顺序重写失败: {e}[/red]")
             # 尝试清理
             try:
+                if 'current_branch' in locals():
+                    # 强制切换回原始分支
+                    self.git_ops.repo.git.checkout(current_branch, '--force')
                 if 'temp_branch' in locals():
-                    self.git_ops.repo.git.checkout(current_branch)
-                    self.git_ops.repo.git.branch('-D', temp_branch)
-            except:
-                pass
+                    # 删除临时分支
+                    try:
+                        self.git_ops.repo.git.branch('-D', temp_branch)
+                    except:
+                        pass
+                # 如果有备份目录，也要尝试恢复
+                if 'backup_dir' in locals() and backup_dir:
+                    self._restore_untracked_files(backup_dir)
+            except Exception as cleanup_error:
+                console.print(f"[yellow]清理失败: {cleanup_error}[/yellow]")
             raise
+    
+    def _resolve_conflicts(self, commit_hash: str) -> bool:
+        """解决 cherry-pick 冲突，返回是否成功解决."""
+        try:
+            # 检查是否有未解决的冲突
+            status_output = self.git_ops.repo.git.status('--porcelain')
+            conflict_files = []
+            
+            for line in status_output.split('\n'):
+                if line.strip() and (line.startswith('UU ') or line.startswith('AA ') or 
+                                   line.startswith('DD ') or line.startswith('AU ') or 
+                                   line.startswith('UA ') or line.startswith('DU ')):
+                    # UU: 两边都修改，二进制文件冲突
+                    # AA: 两边都添加
+                    # DD: 两边都删除
+                    # AU/UA/DU: 混合状态
+                    file_path = line[3:].strip()
+                    conflict_files.append((line[:2], file_path))
+            
+            if not conflict_files:
+                console.print("[yellow]没有检测到冲突文件[/yellow]")
+                return False
+            
+            console.print(f"[yellow]检测到 {len(conflict_files)} 个冲突文件[/yellow]")
+            
+            resolved_count = 0
+            for status, file_path in conflict_files:
+                if self._resolve_single_conflict(status, file_path):
+                    resolved_count += 1
+                    console.print(f"[dim]已解决冲突: {file_path}[/dim]")
+                else:
+                    console.print(f"[red]无法解决冲突: {file_path}[/red]")
+            
+            if resolved_count == len(conflict_files):
+                # 所有冲突都已解决，提交
+                self.git_ops.repo.git.add('.')
+                self.git_ops.repo.git.commit('--no-edit', '--allow-empty', '--no-verify')
+                console.print(f"[green]✓ 所有冲突已解决并提交[/green]")
+                return True
+            else:
+                console.print(f"[red]✗ 仅解决 {resolved_count}/{len(conflict_files)} 个冲突[/red]")
+                return False
+                
+        except Exception as e:
+            console.print(f"[red]冲突解决失败: {e}[/red]")
+            return False
+    
+    def _resolve_single_conflict(self, status: str, file_path: str) -> bool:
+        """解决单个文件的冲突."""
+        try:
+            if status == 'UU':
+                # 二进制文件冲突或内容冲突
+                # 检查是否是二进制文件
+                try:
+                    # 尝试读取文件内容，如果失败则是二进制文件
+                    with open(os.path.join(self.git_ops.repo.working_dir, file_path), 'r', encoding='utf-8') as f:
+                        f.read(1024)  # 只读取前1KB
+                    # 如果能读取，可能是文本文件，尝试使用HEAD版本
+                    console.print(f"[dim]文本文件冲突，使用HEAD版本: {file_path}[/dim]")
+                    self.git_ops.repo.git.checkout('--theirs', file_path)
+                    return True
+                except (UnicodeDecodeError, IOError):
+                    # 二进制文件，使用HEAD版本（保留当前状态）
+                    console.print(f"[dim]二进制文件冲突，使用HEAD版本: {file_path}[/dim]")
+                    # 对于二进制文件，使用 --ours 来接受当前分支的版本
+                    self.git_ops.repo.git.checkout('--ours', file_path)
+                    return True
+                    
+            elif status in ['DU', 'UD', 'AU', 'UA']:
+                # modify/delete 冲突：一侧修改，另一侧删除
+                # 通常选择保留删除（HEAD版本）
+                console.print(f"[dim]修改/删除冲突，使用HEAD版本（删除）: {file_path}[/dim]")
+                if os.path.exists(os.path.join(self.git_ops.repo.working_dir, file_path)):
+                    os.remove(os.path.join(self.git_ops.repo.working_dir, file_path))
+                return True
+                
+            elif status == 'AA':
+                # 两边都添加了相同文件，使用HEAD版本
+                console.print(f"[dim]两边都添加文件，使用HEAD版本: {file_path}[/dim]")
+                return True
+                
+            elif status == 'DD':
+                # 两边都删除了文件，继续
+                console.print(f"[dim]两边都删除文件: {file_path}[/dim]")
+                return True
+                
+            else:
+                console.print(f"[yellow]未知冲突类型 {status}: {file_path}[/yellow]")
+                return False
+                
+        except Exception as e:
+            console.print(f"[red]解决冲突失败 {file_path}: {e}[/red]")
+            return False
     
     def _cleanup_database_file(self) -> None:
         """清理数据库文件."""
@@ -434,6 +579,114 @@ class RewriteExecutor:
         except Exception as e:
             console.print(f"[yellow]⚠ 清理未跟踪文件失败: {e}[/yellow]")
             logger.warning(f"清理未跟踪文件失败: {e}")
+    
+    def _backup_untracked_files(self) -> Optional[str]:
+        """备份未跟踪的文件，返回备份目录路径."""
+        try:
+            import os
+            import shutil
+            import tempfile
+            
+            # 使用 git clean --dry-run 获取将被清理的文件列表
+            try:
+                dry_run_output = self.git_ops.repo.git.clean('--dry-run', '-fd')
+                untracked_files = []
+                
+                if dry_run_output:
+                    # 解析 dry-run 输出
+                    for line in dry_run_output.split('\n'):
+                        if line.strip():
+                            # 去掉 "Would remove " 前缀
+                            if line.startswith('Would remove '):
+                                file_path = line[13:].strip()  # "Would remove " 是13个字符
+                                untracked_files.append(file_path)
+                            elif line.startswith('Would not remove '):
+                                # 跳过不会被删除的文件
+                                continue
+                            else:
+                                # 其他格式，直接添加
+                                untracked_files.append(line.strip())
+                
+                console.print(f"[dim]git clean 将清理 {len(untracked_files)} 个文件/目录[/dim]")
+                
+            except Exception as e:
+                console.print(f"[yellow]git clean dry-run 失败，使用备用方法: {e}[/yellow]")
+                # 备用方法：使用 git status
+                status_output = self.git_ops.repo.git.status('--porcelain')
+                untracked_files = []
+                
+                for line in status_output.split('\n'):
+                    if line.startswith('?? '):
+                        # ?? 表示未跟踪的文件
+                        file_path = line[3:].strip()
+                        untracked_files.append(file_path)
+            
+            if not untracked_files:
+                console.print("[dim]没有未跟踪的文件需要备份[/dim]")
+                return None
+            
+            # 创建临时备份目录
+            backup_dir = tempfile.mkdtemp(prefix='git-rewrite-backup-')
+            console.print(f"[dim]创建备份目录: {backup_dir}[/dim]")
+            
+            # 备份每个未跟踪文件
+            for file_path in untracked_files:
+                src_path = os.path.join(self.git_ops.repo.working_dir, file_path)
+                dst_path = os.path.join(backup_dir, file_path)
+                
+                if os.path.exists(src_path):
+                    # 确保目标目录存在
+                    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                    
+                    if os.path.isfile(src_path):
+                        shutil.copy2(src_path, dst_path)
+                        console.print(f"[dim]已备份文件: {file_path}[/dim]")
+                    elif os.path.isdir(src_path):
+                        shutil.copytree(src_path, dst_path)
+                        console.print(f"[dim]已备份目录: {file_path}[/dim]")
+            
+            console.print(f"[green]✓ 已备份 {len(untracked_files)} 个未跟踪文件/目录[/green]")
+            return backup_dir
+            
+        except Exception as e:
+            console.print(f"[yellow]⚠ 备份未跟踪文件失败: {e}[/yellow]")
+            logger.warning(f"备份未跟踪文件失败: {e}")
+            return None
+    
+    def _restore_untracked_files(self, backup_dir: str) -> None:
+        """恢复备份的未跟踪文件."""
+        try:
+            import os
+            import shutil
+            
+            if not os.path.exists(backup_dir):
+                console.print(f"[yellow]备份目录不存在: {backup_dir}[/yellow]")
+                return
+            
+            # 遍历备份目录中的所有文件
+            restored_count = 0
+            for root, dirs, files in os.walk(backup_dir):
+                for file in files:
+                    # 计算相对路径
+                    rel_path = os.path.relpath(os.path.join(root, file), backup_dir)
+                    src_path = os.path.join(root, file)
+                    dst_path = os.path.join(self.git_ops.repo.working_dir, rel_path)
+                    
+                    # 确保目标目录存在
+                    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                    
+                    # 复制文件
+                    shutil.copy2(src_path, dst_path)
+                    restored_count += 1
+            
+            # 不删除备份目录，让用户手动检查
+            console.print(f"[green]✓ 已恢复 {restored_count} 个文件[/green]")
+            console.print(f"[yellow]备份目录保留在: {backup_dir}[/yellow]")
+            console.print(f"[yellow]请检查文件恢复是否完整，确认后可手动删除备份目录[/yellow]")
+            
+        except Exception as e:
+            console.print(f"[yellow]⚠ 恢复未跟踪文件失败: {e}[/yellow]")
+            logger.warning(f"恢复未跟踪文件失败: {e}")
 
     def _process_group_dry_run(self, group: List[Dict[str, Any]], prompt_template: str) -> None:
         """Dry-run 模式处理分组."""
@@ -552,13 +805,24 @@ class RewriteExecutor:
         stats = self.state_manager.get_statistics()
         self._display_final_stats(stats)
         
-        # 显示回滚命令
+        # 显示备份信息，让用户自己检查和清理
         if not self.dry_run and stats.get('backup_branch'):
+            from rich.panel import Panel
             console.print(Panel(
-                f"如需回滚，请执行:\n[bold]git reset --hard {stats['backup_branch']}[/bold]",
-                title="回滚命令",
+                f"[bold yellow]重要提醒：[/bold yellow]\n\n"
+                f"程序已保留备份分支和文件以供您检查。\n\n"
+                f"[bold]备份分支:[/bold] {stats['backup_branch']}\n"
+                f"[bold]回滚命令:[/bold] git reset --hard {stats['backup_branch']}\n\n"
+                f"请检查目标仓库的文件是否完整。\n"
+                f"确认无误后，可以手动删除备份分支：\n"
+                f"[bold]git branch -D {stats['backup_branch']}[/bold]\n\n"
+                f"如发现文件丢失，请使用备份分支恢复。",
+                title="备份信息",
                 border_style="yellow"
             ))
+        
+        # 不自动清理数据库文件，让用户手动处理
+        console.print("[yellow]数据库文件已保留，如需清理请手动删除[/yellow]")
     
     def _display_final_stats(self, stats: Dict[str, Any]) -> None:
         """显示最终统计信息."""
@@ -595,8 +859,8 @@ class RewriteExecutor:
             console.print(f"[red]分析失败: {e}[/red]")
             raise
         finally:
-            # 清理数据库文件
-            self._cleanup_database_file()
+            # 不自动清理数据库文件，让用户手动处理
+            console.print("[yellow]数据库文件已保留，如需清理请手动删除[/yellow]")
     
     def _display_detailed_analysis(self, groups: List[List[Dict[str, Any]]]) -> None:
         """显示详细分析结果."""
@@ -639,8 +903,8 @@ class RewriteExecutor:
             console.print(f"[red]获取状态失败: {e}[/red]")
             return {}
         finally:
-            # 清理数据库文件
-            self._cleanup_database_file()
+            # 不自动清理数据库文件，让用户手动处理
+            console.print("[yellow]数据库文件已保留，如需清理请手动删除[/yellow]")
     
     def list_backups(self) -> List[str]:
         """列出备份分支."""
@@ -651,8 +915,8 @@ class RewriteExecutor:
             console.print(f"[red]获取备份分支失败: {e}[/red]")
             return []
         finally:
-            # 清理数据库文件
-            self._cleanup_database_file()
+            # 不自动清理数据库文件，让用户手动处理
+            console.print("[yellow]数据库文件已保留，如需清理请手动删除[/yellow]")
     
     def rollback(self, backup_branch: str) -> bool:
         """回滚到备份分支."""
@@ -663,5 +927,5 @@ class RewriteExecutor:
             console.print(f"[red]回滚失败: {e}[/red]")
             return False
         finally:
-            # 清理数据库文件
-            self._cleanup_database_file()
+            # 不自动清理数据库文件，让用户手动处理
+            console.print("[yellow]数据库文件已保留，如需清理请手动删除[/yellow]")

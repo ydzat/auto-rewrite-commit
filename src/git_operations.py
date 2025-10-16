@@ -98,11 +98,13 @@ class GitOperations:
         """
         if branch:
             try:
-                commits = list(self.repo.iter_commits(branch, reverse=True))
+                # 使用 --first-parent 只扫描当前分支的直接祖先，避免复杂分支历史
+                commits = list(self.repo.iter_commits(branch, reverse=True, first_parent=True))
             except Exception as e:
                 raise RuntimeError(f"无法获取分支 {branch} 的提交: {e}")
         else:
-            commits = list(self.repo.iter_commits(reverse=True))
+            # 使用 --first-parent 只扫描当前分支的直接祖先
+            commits = list(self.repo.iter_commits(reverse=True, first_parent=True))
         
         commit_data_list = []
         
@@ -119,7 +121,7 @@ class GitOperations:
                 logger.error(f"提取提交数据失败 {commit.hexsha}: {e}")
                 continue
         
-        logger.info(f"扫描完成，共 {len(commit_data_list)} 个提交")
+        logger.info(f"扫描完成，共 {len(commit_data_list)} 个提交 (仅当前分支直接祖先)")
         return commit_data_list
     
     def _extract_commit_data(self, commit: Commit) -> Dict[str, Any]:
