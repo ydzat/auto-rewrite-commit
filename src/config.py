@@ -151,7 +151,11 @@ class ConfigManager:
     
     def get_database_path(self) -> str:
         """获取数据库路径."""
-        return self.get('database.path', '.git-rewrite.db')
+        # 数据库文件应该在本项目目录中，而不是目标仓库目录中
+        # 这样可以避免干扰目标仓库的 Git 操作
+        project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        db_name = self.get('database.path', '.git-rewrite.db')
+        return os.path.join(project_dir, db_name)
     
     def get_ai_config(self) -> Dict[str, Any]:
         """获取 AI 配置."""

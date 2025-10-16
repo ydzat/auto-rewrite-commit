@@ -2,6 +2,8 @@
 
 import os
 import logging
+import tempfile
+import time
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 
@@ -16,7 +18,7 @@ from .git_operations import GitOperations
 from .clustering import CommitClusterer
 from .ai_rewriter import AIRewriter
 from .state_manager import StateManager
-from .utils import setup_logging, get_timestamp
+from .utils import setup_logging
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -111,6 +113,9 @@ class RewriteExecutor:
             console.print(f"[red]执行失败: {e}[/red]")
             logger.exception("执行过程中发生错误")
             raise
+        finally:
+            # 清理数据库文件
+            self._cleanup_database_file()
     
     def _start_new_execution(self) -> None:
         """开始新的执行流程."""
@@ -261,205 +266,119 @@ class RewriteExecutor:
             # 实际执行：逐步执行 rebase
             self._stepwise_rebase_execution(groups, prompt_template, progress, task)
     
-    def _stepwise_rebase_execution(self, groups: List[List[Dict[str, Any]]], 
+    def _stepwise_rebase_execution(self, groups: List[List[Dict[str, Any]]],
                                   prompt_template: str, progress, task) -> None:
-        """逐步执行 rebase：每次处理一个分组，立即应用修改."""
+        """使用顺序重写执行逐步重写."""
         try:
-            console.print("[bold]开始逐步执行 git rebase...[/bold]")
-            
-            # 获取所有原始提交
-            all_commits = self.db_manager.get_all_commits()
-            console.print(f"[dim]数据库中共有 {len(all_commits)} 个提交[/dim]")
-            
-            if not all_commits:
-                console.print("[yellow]没有找到提交，跳过 rebase[/yellow]")
-                return
-            
-            # 找到第一个非 root commit（最老的，但有父提交的）
-            non_root_commits = [c for c in all_commits if c.get('parent_hash')]
-            if not non_root_commits:
-                console.print("[yellow]没有找到非 root commit，跳过 rebase[/yellow]")
-                return
-            
-            first_commit = min(non_root_commits, key=lambda x: x['commit_date'])
-            console.print(f"[dim]找到第一个非 root commit: {first_commit['hash'][:8]} ({first_commit['message']})[/dim]")
-            console.print(f"[dim]完整哈希: {first_commit['hash']}[/dim]")
-            
-            # 逐步处理每个分组
-            for i, group in enumerate(groups):
-                progress.update(task, advance=1, description=f"处理分组 {i+1}/{len(groups)}")
-                
-                # 跳过 root commit
-                if len(group) == 1 and not group[0].get('parent_hash'):
-                    console.print(f"[yellow]跳过 root commit: {group[0]['hash'][:8]}[/yellow]")
-                    continue
-                
-                # 调用 LLM 生成新消息
+            console.print("[bold]开始顺序重写...[/bold]")
+
+            # 生成所有提交的新消息
+            commit_messages = {}
+            for group in groups:
                 if len(group) == 1:
                     new_message = self.ai_rewriter.rewrite_single_commit(group[0], prompt_template)
                 else:
-                    new_message = self.ai_rewriter.merge_commit_messages(group, prompt_template)
-                
+                    new_message = self.ai_rewriter.rewrite_commit_messages(group, prompt_template)
                 new_message = self.ai_rewriter.apply_conventional_format(new_message)
-                
-                console.print(f"[dim]分组 {i+1}: {len(group)} 个提交 -> {new_message}[/dim]")
-                
-                # 立即执行 rebase 应用这个修改
-                console.print(f"[dim]传递给 rebase 的 base_commit: {first_commit['hash']}[/dim]")
-                self._execute_single_rebase_step(group, new_message, first_commit['hash'])
-                
-                # 更新状态
-                self._update_state_after_rebase(group, new_message)
-                
-            console.print("[green]✓ 逐步 rebase 执行完成[/green]")
-            
+
+                # 为分组中的每个提交记录新消息
+                for commit in group:
+                    commit_messages[commit['hash']] = new_message
+
+            # 使用顺序重写而不是交互式 rebase
+            self._sequential_rewrite(commit_messages, progress, task)
+
+            # 更新状态：标记所有处理过的提交为已完成
+            self._update_state_after_rebase_all(commit_messages)
+
+            console.print("[green]✓ 顺序重写完成[/green]")
+
         except Exception as e:
-            console.print(f"[red]✗ 逐步 rebase 失败: {e}[/red]")
-            logger.exception("逐步 rebase 失败")
+            console.print(f"[red]✗ 顺序重写失败: {e}[/red]")
+            logger.exception("顺序重写失败")
             raise
     
-    def _execute_single_rebase_step(self, group: List[Dict[str, Any]], 
-                                   new_message: str, base_commit: str) -> None:
-        """执行单个 rebase 步骤：处理一个提交组."""
+    def _sequential_rewrite(self, commit_messages: Dict[str, str], progress, task) -> None:
+        """使用顺序 cherry-pick 重写提交历史."""
         try:
-            # 创建针对这个分组的 rebase 脚本
-            rebase_script = self._create_single_group_rebase_script(group, new_message)
+            console.print("[bold]开始顺序 cherry-pick 重写...[/bold]")
+
+            # 获取当前分支
+            current_branch = self.git_ops.repo.active_branch.name
+            console.print(f"[dim]当前分支: {current_branch}[/dim]")
+
+            # 创建临时重写分支
+            temp_branch = f"temp-rewrite-{int(time.time())}"
+            self.git_ops.repo.git.checkout('-b', temp_branch)
+            console.print(f"[dim]创建临时分支: {temp_branch}[/dim]")
+
+            # 重置到 root 提交
+            root_commit = self.git_ops.repo.git.rev_list('--max-parents=0', 'HEAD').strip()
+            self.git_ops.repo.git.reset('--hard', root_commit)
+            console.print(f"[dim]重置到根提交: {root_commit[:8]}[/dim]")
+
+            # 获取所有提交的有序列表
+            all_commits = self.db_manager.get_all_commits()
+            sorted_commits = sorted(all_commits, key=lambda x: x['commit_date'])
+
+            # 逐个 cherry-pick 并修改消息
+            for i, commit in enumerate(sorted_commits):
+                commit_hash = commit['hash']
+                progress.update(task, advance=1, description=f"处理提交 {i+1}/{len(sorted_commits)}: {commit_hash[:8]}")
+
+                try:
+                    # Cherry-pick 提交
+                    self.git_ops.repo.git.cherry_pick(commit_hash, '--allow-empty', '--keep-redundant-commits')
+                    
+                    # 如果需要修改消息
+                    if commit_hash in commit_messages:
+                        new_message = commit_messages[commit_hash]
+                        self.git_ops.repo.git.commit('--amend', '-m', new_message, '--allow-empty', '--no-edit')
+                        console.print(f"[dim]修改提交 {commit_hash[:8]} 的消息[/dim]")
+                    
+                except Exception as cherry_error:
+                    console.print(f"[yellow]Cherry-pick 失败 {commit_hash[:8]}: {cherry_error}[/yellow]")
+                    # 尝试继续
+                    try:
+                        self.git_ops.repo.git.cherry_pick('--continue')
+                    except:
+                        self.git_ops.repo.git.cherry_pick('--abort')
+                        raise cherry_error
+
+            # 切换回原始分支并强制更新
+            console.print(f"[dim]切换回分支: {current_branch}[/dim]")
+            self.git_ops.repo.git.checkout(current_branch)
             
-            if not rebase_script.strip():
-                console.print("[yellow]生成的 rebase 脚本为空，跳过[/yellow]")
-                return
+            console.print(f"[dim]强制更新分支 {current_branch} 到 {temp_branch}[/dim]")
+            self.git_ops.repo.git.reset('--hard', temp_branch)
             
-            # 清理未跟踪的文件
-            self._cleanup_untracked_files()
-            
-            # 执行交互式 rebase
-            console.print(f"[dim]执行单个 rebase 步骤...[/dim]")
-            self._execute_interactive_rebase(base_commit, rebase_script, new_message)
-            
-            console.print(f"[green]✓ 单个 rebase 步骤完成[/green]")
-            
+            # 删除临时分支
+            self.git_ops.repo.git.branch('-D', temp_branch)
+            console.print(f"[dim]删除临时分支: {temp_branch}[/dim]")
+
+            console.print("[green]✓ 顺序 cherry-pick 重写完成[/green]")
+
         except Exception as e:
-            console.print(f"[red]✗ 单个 rebase 步骤失败: {e}[/red]")
-            logger.exception("单个 rebase 步骤失败")
-            raise
-    
-    def _create_single_group_rebase_script(self, group: List[Dict[str, Any]], 
-                                         new_message: str) -> str:
-        """为单个分组创建 rebase 脚本."""
-        script_lines = []
-        
-        if len(group) == 1:
-            # 单个提交：reword
-            commit = group[0]
-            console.print(f"[dim]单个提交哈希: {commit['hash']}[/dim]")
-            script_lines.append(f"reword {commit['hash']}")
-        else:
-            # 多个提交：第一个 reword，其他 squash
-            console.print(f"[dim]第一个提交哈希: {group[0]['hash']}[/dim]")
-            script_lines.append(f"reword {group[0]['hash']}")
-            for commit in group[1:]:
-                console.print(f"[dim]其他提交哈希: {commit['hash']}[/dim]")
-                script_lines.append(f"squash {commit['hash']}")
-        
-        script = '\n'.join(script_lines)
-        console.print(f"[dim]单个分组 rebase 脚本:[/dim]")
-        console.print(f"[dim]{script}[/dim]")
-        
-        return script
-    
-    def _execute_interactive_rebase(self, base_commit: str, script: str, new_message: str = None) -> None:
-        """执行交互式 rebase."""
-        import tempfile
-        import os
-        
-        try:
-            console.print(f"[bold]开始执行 git rebase -i {base_commit[:8]}...[/bold]")
-            console.print(f"[dim]Rebase 脚本:[/dim]")
-            console.print(f"[dim]{script}[/dim]")
-            
-            # 创建临时脚本文件
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.rebase', delete=False) as f:
-                f.write(script)
-                script_path = f.name
-            
-            console.print(f"[dim]临时脚本文件: {script_path}[/dim]")
-            
-            # 创建一个包装脚本来处理 rebase 过程
-            wrapper_script = self._create_rebase_wrapper(script_path, new_message)
-            
-            # 设置环境变量
-            env = os.environ.copy()
-            env['GIT_EDITOR'] = wrapper_script
-            
-            console.print("[dim]执行 git rebase 命令...[/dim]")
-            console.print(f"[dim]环境变量 GIT_EDITOR: {env['GIT_EDITOR']}[/dim]")
-            
-            # 执行 rebase
-            result = self.git_ops.repo.git.rebase('-i', base_commit, env=env)
-            console.print(f"[green]✓ Git rebase 执行成功[/green]")
-            console.print(f"[dim]结果: {result}[/dim]")
-            
-            # 清理临时文件
-            os.unlink(script_path)
-            os.unlink(wrapper_script)
-            console.print("[dim]临时文件已清理[/dim]")
-            
-        except Exception as e:
-            console.print(f"[red]✗ Git rebase 执行失败: {e}[/red]")
-            logger.exception("Git rebase 执行失败")
-            
-            # 如果 rebase 失败，尝试中止
+            console.print(f"[red]顺序重写失败: {e}[/red]")
+            # 尝试清理
             try:
-                console.print("[yellow]尝试中止 rebase...[/yellow]")
-                self.git_ops.repo.git.rebase('--abort')
-                console.print("[green]✓ Rebase 已中止[/green]")
-            except Exception as abort_error:
-                console.print(f"[red]✗ 中止 rebase 失败: {abort_error}[/red]")
-                logger.exception("中止 rebase 失败")
-            
-            # 清理临时文件
-            try:
-                if 'script_path' in locals():
-                    os.unlink(script_path)
-                if 'wrapper_script' in locals():
-                    os.unlink(wrapper_script)
+                if 'temp_branch' in locals():
+                    self.git_ops.repo.git.checkout(current_branch)
+                    self.git_ops.repo.git.branch('-D', temp_branch)
             except:
                 pass
-            
             raise
     
-    def _create_rebase_wrapper(self, script_path: str, new_message: str = None) -> str:
-        """创建 rebase 包装脚本."""
-        import tempfile
-        import os
-        
-        if new_message:
-            # 如果提供了新消息，自动设置提交消息
-            # 转义消息中的特殊字符
-            escaped_message = new_message.replace("'", "'\\''")
-            wrapper_content = f"""#!/bin/bash
-# 复制 rebase 脚本到目标文件
-cp "{script_path}" "$1"
-
-# 自动设置提交消息（使用 echo 写入消息文件）
-echo '{escaped_message}' > "$1.msg"
-"""
-        else:
-            # 如果没有新消息，只复制脚本
-            wrapper_content = f"""#!/bin/bash
-# 复制 rebase 脚本到目标文件
-cp "{script_path}" "$1"
-"""
-        
-        # 创建可执行的包装脚本
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
-            f.write(wrapper_content)
-            wrapper_path = f.name
-        
-        # 使脚本可执行
-        os.chmod(wrapper_path, 0o755)
-        
-        return wrapper_path
+    def _cleanup_database_file(self) -> None:
+        """清理数据库文件."""
+        try:
+            db_path = self.config_manager.get_database_path()
+            if os.path.exists(db_path):
+                os.remove(db_path)
+                console.print(f"[dim]已清理数据库文件: {db_path}[/dim]")
+        except Exception as e:
+            console.print(f"[yellow]⚠ 清理数据库文件失败: {e}[/yellow]")
+            logger.warning(f"清理数据库文件失败: {e}")
     
     def _cleanup_untracked_files(self) -> None:
         """清理未跟踪的文件."""
@@ -509,7 +428,7 @@ cp "{script_path}" "$1"
         except Exception as e:
             console.print(f"[yellow]⚠ 清理未跟踪文件失败: {e}[/yellow]")
             logger.warning(f"清理未跟踪文件失败: {e}")
-    
+
     def _process_group_dry_run(self, group: List[Dict[str, Any]], prompt_template: str) -> None:
         """Dry-run 模式处理分组."""
         if len(group) == 1:
@@ -576,18 +495,26 @@ cp "{script_path}" "$1"
             logger.exception("强制推送失败")
             # 不抛出异常，因为推送失败不应该阻止本地重写
     
-    def _update_state_after_rebase(self, group: List[Dict[str, Any]], new_message: str) -> None:
-        """在 rebase 后更新状态."""
+    def _update_state_after_rebase_all(self, commit_messages: Dict[str, str]) -> None:
+        """在 rebase 后更新所有处理过的提交的状态."""
         try:
             # 获取当前 HEAD 作为新的提交哈希
             current_head = self.git_ops.repo.head.commit.hexsha
             
-            # 更新状态映射
-            for commit in group:
-                self.state_manager.update_commit_status(commit['hash'], 'done')
-                self.state_manager.add_hash_mapping(commit['hash'], current_head)
+            # 更新所有处理过的提交状态
+            processed_count = 0
+            for commit_hash, new_message in commit_messages.items():
+                self.state_manager.mark_commit_processed(commit_hash, 'done')
+                self.state_manager.save_hash_mapping(commit_hash, current_head)
+                processed_count += 1
             
-            console.print(f"[dim]状态已更新: {len(group)} 个提交映射到 {current_head[:8]}[/dim]")
+            # 更新会话状态中的已处理提交数量
+            current_state = self.state_manager.get_current_state()
+            if current_state:
+                total_processed = current_state.get('processed_commits', 0) + processed_count
+                self.state_manager.update_session(processed_commits=total_processed)
+            
+            console.print(f"[dim]状态已更新: {processed_count} 个提交已处理[/dim]")
             
         except Exception as e:
             console.print(f"[yellow]⚠ 更新状态失败: {e}[/yellow]")
@@ -661,6 +588,9 @@ cp "{script_path}" "$1"
         except Exception as e:
             console.print(f"[red]分析失败: {e}[/red]")
             raise
+        finally:
+            # 清理数据库文件
+            self._cleanup_database_file()
     
     def _display_detailed_analysis(self, groups: List[List[Dict[str, Any]]]) -> None:
         """显示详细分析结果."""
@@ -702,6 +632,9 @@ cp "{script_path}" "$1"
         except Exception as e:
             console.print(f"[red]获取状态失败: {e}[/red]")
             return {}
+        finally:
+            # 清理数据库文件
+            self._cleanup_database_file()
     
     def list_backups(self) -> List[str]:
         """列出备份分支."""
@@ -711,6 +644,9 @@ cp "{script_path}" "$1"
         except Exception as e:
             console.print(f"[red]获取备份分支失败: {e}[/red]")
             return []
+        finally:
+            # 清理数据库文件
+            self._cleanup_database_file()
     
     def rollback(self, backup_branch: str) -> bool:
         """回滚到备份分支."""
@@ -720,3 +656,6 @@ cp "{script_path}" "$1"
         except Exception as e:
             console.print(f"[red]回滚失败: {e}[/red]")
             return False
+        finally:
+            # 清理数据库文件
+            self._cleanup_database_file()
