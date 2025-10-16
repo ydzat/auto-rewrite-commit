@@ -190,7 +190,13 @@ class RewriteExecutor:
         """聚类提交."""
         console.print("[bold]分析提交相似度...[/bold]")
         
-        groups = self.clusterer.analyze_similarity(commits)
+        # 检查是否禁用合并（临时解决方案）
+        disable_merging = self.config_manager.get('clustering.disable_merging', False)
+        if disable_merging:
+            console.print("[yellow]⚠ 合并功能已禁用，所有提交将作为单个提交处理[/yellow]")
+            groups = [[commit] for commit in commits]
+        else:
+            groups = self.clusterer.analyze_similarity(commits)
         
         # 显示聚类统计
         stats = self.clusterer.get_group_statistics(groups)
